@@ -2,6 +2,7 @@ import argparse
 from decimal import Decimal, InvalidOperation
 import json
 import os
+from pathlib import Path
 import sys
 import urllib.error
 import urllib.parse
@@ -61,15 +62,23 @@ def validate_product_payload(
     }
 
 
-def request_api(
+def _parse_error_detail(raw: str, fallback: str) -> dict:
+    try:
+        return json.loads(raw)
+    except ValueError:
+        return {"detail": raw or fallback}
+
+
+def _execute_request(
     base_url: str,
     method: str,
     path: str,
     payload: dict | None = None,
     token: str | None = None,
-) -> tuple[int, dict]:
+    accept: str = "application/json",
+) -> tuple[int, str, str | None]:
     url = f"{base_url.rstrip('/')}{path}"
-    headers = {"Accept": "application/json"}
+    headers = {"Accept": accept}
     data = None
     if payload is not None:
         headers["Content-Type"] = "application/json"
@@ -80,16 +89,98 @@ def request_api(
     req = urllib.request.Request(url=url, data=data, headers=headers, method=method)
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
-            raw = resp.read().decode("utf-8")
-            body = json.loads(raw) if raw else {}
-            return resp.status, body
+            return resp.status, resp.read().decode("utf-8"), None
     except urllib.error.HTTPError as exc:
-        raw = exc.read().decode("utf-8")
-        try:
-            detail = json.loads(raw)
-        except ValueError:
-            detail = {"detail": raw or exc.reason}
-        return exc.code, detail
+        return exc.code, exc.read().decode("utf-8"), str(exc.reason)
+
+
+def request_api(
+    base_url: str,
+    method: str,
+    path: str,
+    payload: dict | None = None,
+    token: str | None = None,
+) -> tuple[int, dict]:
+    status, raw, reason = _execute_request(
+        base_url, method, path, payload=payload, token=token
+    )
+    if reason is not None:
+        return status, _parse_error_detail(raw, reason)
+    return status, json.loads(raw) if raw else {}
+
+
+def request_csv(
+    base_url: str,
+    path: str,
+    token: str,
+) -> tuple[int, str | dict]:
+    status, raw, reason = _execute_request(
+        base_url, "GET", path, token=token, accept="text/csv"
+    )
+    if reason is not None:
+        return status, _parse_error_detail(raw, reason)
+    return status, raw
+
+
+def _add_filter_arguments(
+    subparser: argparse.ArgumentParser, include_page: bool = True
+) -> None:
+    subparser.add_argument(
+        "--search", default=None, help="Trecho do nome do produto"
+    )
+    subparser.add_argument(
+        "--category",
+        choices=VALID_CATEGORIES,
+        default=None,
+        help="Categoria exata do produto",
+    )
+    subparser.add_argument(
+        "--min-price",
+        dest="min_price",
+        default=None,
+        help="Preco minimo inclusivo (>= 0)",
+    )
+    subparser.add_argument(
+        "--max-price",
+        dest="max_price",
+        default=None,
+        help="Preco maximo inclusivo (>= 0)",
+    )
+    if include_page:
+        subparser.add_argument(
+            "--page", type=int, default=1, help="Numero da pagina"
+        )
+    subparser.add_argument(
+        "--sort-by",
+        choices=("id", "name", "category", "price", "stock"),
+        default="id",
+        help="Campo de ordenacao",
+    )
+    subparser.add_argument(
+        "--order",
+        choices=("asc", "desc"),
+        default="asc",
+        help="Direcao da ordenacao",
+    )
+
+
+def _build_filter_query(
+    args: argparse.Namespace, include_page: bool = True
+) -> str:
+    params: dict[str, str | int] = {}
+    if include_page:
+        params["page"] = args.page
+    params["sort_by"] = args.sort_by
+    params["order"] = args.order
+    if args.search is not None and args.search.strip():
+        params["search"] = args.search.strip()
+    if args.category is not None:
+        params["category"] = args.category
+    if args.min_price is not None:
+        params["min_price"] = args.min_price
+    if args.max_price is not None:
+        params["max_price"] = args.max_price
+    return urllib.parse.urlencode(params)
 
 
 def _add_product_arguments(subparser: argparse.ArgumentParser) -> None:
@@ -181,41 +272,17 @@ def build_parser() -> argparse.ArgumentParser:
         "search",
         help="Busca avancada de produtos via API CLI (GET /api/cli/records/search)",
     )
-    search_parser.add_argument(
-        "--search", default=None, help="Trecho do nome do produto"
+    _add_filter_arguments(search_parser, include_page=True)
+
+    export_parser = subparsers.add_parser(
+        "export",
+        help="Exporta produtos em CSV via API CLI (GET /api/cli/records/export)",
     )
-    search_parser.add_argument(
-        "--category",
-        choices=VALID_CATEGORIES,
+    _add_filter_arguments(export_parser, include_page=False)
+    export_parser.add_argument(
+        "--output",
         default=None,
-        help="Categoria exata do produto",
-    )
-    search_parser.add_argument(
-        "--min-price",
-        dest="min_price",
-        default=None,
-        help="Preco minimo inclusivo (>= 0)",
-    )
-    search_parser.add_argument(
-        "--max-price",
-        dest="max_price",
-        default=None,
-        help="Preco maximo inclusivo (>= 0)",
-    )
-    search_parser.add_argument(
-        "--page", type=int, default=1, help="Numero da pagina"
-    )
-    search_parser.add_argument(
-        "--sort-by",
-        choices=("id", "name", "category", "price", "stock"),
-        default="id",
-        help="Campo de ordenacao",
-    )
-    search_parser.add_argument(
-        "--order",
-        choices=("asc", "desc"),
-        default="asc",
-        help="Direcao da ordenacao",
+        help="Caminho de arquivo para salvar o CSV gerado (padrao: stdout)",
     )
 
     return parser
@@ -272,26 +339,33 @@ def main(argv: list[str] | None = None) -> int:
                 token=token,
             )
         elif args.command == "search":
-            params: dict[str, str | int] = {
-                "page": args.page,
-                "sort_by": args.sort_by,
-                "order": args.order,
-            }
-            if args.search is not None and args.search.strip():
-                params["search"] = args.search.strip()
-            if args.category is not None:
-                params["category"] = args.category
-            if args.min_price is not None:
-                params["min_price"] = args.min_price
-            if args.max_price is not None:
-                params["max_price"] = args.max_price
-            query = urllib.parse.urlencode(params)
+            query = _build_filter_query(args, include_page=True)
             status, body = request_api(
                 args.base_url,
                 "GET",
                 f"/api/cli/records/search?{query}",
                 token=token,
             )
+        elif args.command == "export":
+            query = _build_filter_query(args, include_page=False)
+            status, csv_result = request_csv(
+                args.base_url,
+                f"/api/cli/records/export?{query}",
+                token=token,
+            )
+            if not (200 <= status < 300):
+                print(json.dumps(csv_result, ensure_ascii=False))
+                return 1
+            if args.output:
+                Path(args.output).write_text(str(csv_result), encoding="utf-8")
+                print(
+                    json.dumps(
+                        {"status": "ok", "output": args.output}, ensure_ascii=False
+                    )
+                )
+            else:
+                print(csv_result, end="")
+            return 0
         elif args.command == "delete":
             status, body = request_api(
                 args.base_url,

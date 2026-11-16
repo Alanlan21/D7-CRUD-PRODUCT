@@ -729,3 +729,47 @@ def cli_search_products(
         message="Produtos buscados no banco via CLI",
     )
     return {"items": items, "total": total}
+
+
+def cli_export_products(
+    search: str | None,
+    category: str | None,
+    min_price: Decimal | None,
+    max_price: Decimal | None,
+    sort_by: str,
+    order: str,
+    request_id: str,
+) -> list[dict]:
+    where_clause, filter_params = _build_product_filters(
+        search=search,
+        category=category,
+        min_price=min_price,
+        max_price=max_price,
+    )
+    sort_column = SORT_COLUMNS[sort_by]
+    sort_direction = "ASC" if order.lower() == "asc" else "DESC"
+
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT id, name, category, price, stock, description
+                FROM products{where_clause}
+                ORDER BY {sort_column} {sort_direction}, id ASC;
+                """,
+                tuple(filter_params),
+            )
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    items = [_product_from_row(row) for row in rows]
+    log_db(
+        client="cli",
+        operation="export",
+        status="success",
+        request_id=request_id,
+        message="Produtos consultados para exportacao CSV via CLI",
+    )
+    return items

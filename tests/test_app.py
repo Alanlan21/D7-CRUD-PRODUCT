@@ -1742,3 +1742,214 @@ def test_cli_search_command(capsys, monkeypatch):
         "/api/cli/records/search?page=1&sort_by=id&order=asc"
     )
     capsys.readouterr()
+
+
+def test_db_cli_export_products_with_and_without_filters(capsys):
+    row = (17, "Teclado Mecanico", "Perifericos", Decimal("249.90"), 12, "RGB")
+    conn_filtered, cur_filtered = _make_mock_conn()
+    cur_filtered.fetchall.return_value = [row]
+
+    with patch("db.get_connection", return_value=conn_filtered):
+        filtered = db.cli_export_products(
+            search="tecla",
+            category="Perifericos",
+            min_price=Decimal("100.00"),
+            max_price=Decimal("300.00"),
+            sort_by="price",
+            order="desc",
+            request_id="req-cli-exp-1",
+        )
+
+    sql_filtered, params_filtered = cur_filtered.execute.call_args.args
+    assert "WHERE" in sql_filtered
+    assert "LIMIT" not in sql_filtered
+    assert "ORDER BY price DESC, id ASC" in sql_filtered
+    assert params_filtered == (
+        "%tecla%",
+        "Perifericos",
+        Decimal("100.00"),
+        Decimal("300.00"),
+    )
+    assert len(filtered) == 1
+    assert filtered[0]["name"] == "Teclado Mecanico"
+    conn_filtered.close.assert_called_once()
+
+    conn_all, cur_all = _make_mock_conn()
+    cur_all.fetchall.return_value = []
+    with patch("db.get_connection", return_value=conn_all):
+        empty = db.cli_export_products(
+            search=None,
+            category=None,
+            min_price=None,
+            max_price=None,
+            sort_by="id",
+            order="asc",
+            request_id="req-cli-exp-2",
+        )
+
+    sql_all, params_all = cur_all.execute.call_args.args
+    assert "WHERE" not in sql_all
+    assert "LIMIT" not in sql_all
+    assert params_all == ()
+    assert empty == []
+    conn_all.close.assert_called_once()
+
+    logs = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert [entry["client"] for entry in logs] == ["cli", "cli"]
+    assert [entry["operation"] for entry in logs] == ["export", "export"]
+    assert [entry["request_id"] for entry in logs] == [
+        "req-cli-exp-1",
+        "req-cli-exp-2",
+    ]
+
+
+def test_api_cli_export_products_auth_filters_and_csv(capsys):
+    sample_items = [
+        {
+            "id": 17,
+            "name": "Teclado Mecanico",
+            "category": "Perifericos",
+            "price": Decimal("249.90"),
+            "stock": 12,
+            "description": "RGB",
+        }
+    ]
+    with patch("db.init_db"):
+        with TestClient(api.app) as client:
+            unauth = client.get("/api/cli/records/export")
+            assert unauth.status_code == 401
+
+            cli_token = api.create_cli_token("admin")
+            headers = {"Authorization": f"Bearer {cli_token}"}
+            with patch("db.cli_export_products", return_value=sample_items) as exp_mock:
+                res_ok = client.get(
+                    "/api/cli/records/export"
+                    "?search=tecla&category=Perifericos&min_price=100"
+                    "&max_price=300&sort_by=price&order=desc",
+                    headers=headers,
+                )
+                bad_range = client.get(
+                    "/api/cli/records/export?min_price=300&max_price=100",
+                    headers=headers,
+                )
+
+    assert res_ok.status_code == 200
+    assert res_ok.headers["content-type"].startswith("text/csv")
+    assert 'filename="produtos_cli.csv"' in res_ok.headers["content-disposition"]
+    assert res_ok.text.splitlines() == [
+        "id,name,category,price,stock,description",
+        "17,Teclado Mecanico,Perifericos,249.90,12,RGB",
+    ]
+    exp_kwargs = exp_mock.call_args.kwargs
+    assert exp_kwargs["search"] == "tecla"
+    assert exp_kwargs["category"] == "Perifericos"
+    assert exp_kwargs["min_price"] == Decimal("100")
+    assert exp_kwargs["max_price"] == Decimal("300")
+    assert exp_kwargs["sort_by"] == "price"
+    assert exp_kwargs["order"] == "desc"
+    assert bad_range.status_code == 422
+
+    logs = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    exp_logs = [
+        entry
+        for entry in logs
+        if entry["client"] == "cli" and entry["operation"] == "export"
+    ]
+    assert len(exp_logs) == 1
+    assert exp_logs[0]["request_id"] == exp_kwargs["request_id"]
+
+
+def test_cli_export_command(capsys, monkeypatch, tmp_path):
+    monkeypatch.delenv("CLI_TOKEN", raising=False)
+    assert cli.main(["export"]) == 1
+    assert "CLI_TOKEN" in capsys.readouterr().err
+
+    csv_payload = (
+        "id,name,category,price,stock,description\n"
+        "17,Teclado Mecanico,Perifericos,249.90,12,RGB\n"
+    )
+
+    def _mock_csv_resp(status: int, text: str):
+        resp = MagicMock()
+        resp.status = status
+        resp.read.return_value = text.encode("utf-8")
+        cm = MagicMock()
+        cm.__enter__.return_value = resp
+        return cm
+
+    with patch(
+        "urllib.request.urlopen",
+        return_value=_mock_csv_resp(200, csv_payload),
+    ) as mock_stdout:
+        rc_stdout = cli.main(
+            [
+                "--token",
+                "tok-cli",
+                "export",
+                "--search",
+                "tecla",
+                "--category",
+                "Perifericos",
+                "--min-price",
+                "100.00",
+                "--max-price",
+                "300.00",
+                "--sort-by",
+                "price",
+                "--order",
+                "desc",
+            ]
+        )
+    assert rc_stdout == 0
+    req_stdout = mock_stdout.call_args.args[0]
+    assert req_stdout.get_method() == "GET"
+    assert req_stdout.headers["Accept"] == "text/csv"
+    assert req_stdout.headers["Authorization"] == "Bearer tok-cli"
+    assert req_stdout.full_url.endswith(
+        "/api/cli/records/export?sort_by=price&order=desc"
+        "&search=tecla&category=Perifericos&min_price=100.00&max_price=300.00"
+    )
+    assert capsys.readouterr().out == csv_payload
+
+    out_file = tmp_path / "produtos_cli.csv"
+    with patch(
+        "urllib.request.urlopen",
+        return_value=_mock_csv_resp(200, csv_payload),
+    ):
+        rc_file = cli.main(
+            ["--token", "tok-cli", "export", "--output", str(out_file)]
+        )
+    assert rc_file == 0
+    assert out_file.read_text(encoding="utf-8") == csv_payload
+    assert json.loads(capsys.readouterr().out.strip()) == {
+        "status": "ok",
+        "output": str(out_file),
+    }
+
+    http_422 = urllib.error.HTTPError(
+        "http://api:8000/api/cli/records/export",
+        422,
+        "Unprocessable Entity",
+        {},
+        io.BytesIO(b'{"detail":"Faixa de preco invalida"}'),
+    )
+    with patch("urllib.request.urlopen", side_effect=http_422):
+        rc_err = cli.main(["--token", "tok-cli", "export"])
+    assert rc_err == 1
+    assert json.loads(capsys.readouterr().out.strip()) == {
+        "detail": "Faixa de preco invalida"
+    }
+
+    http_502 = urllib.error.HTTPError(
+        "http://api:8000/api/cli/records/export",
+        502,
+        "Bad Gateway",
+        {},
+        io.BytesIO(b"gateway error"),
+    )
+    with patch("urllib.request.urlopen", side_effect=http_502):
+        code_502, err_502 = cli.request_csv(
+            "http://api:8000", "/api/cli/records/export", token="tok-cli"
+        )
+    assert code_502 == 502
+    assert err_502 == {"detail": "gateway error"}
