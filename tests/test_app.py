@@ -1,4 +1,8 @@
+import io
 import json
+import runpy
+import sys
+import urllib.error
 from decimal import Decimal
 from unittest.mock import MagicMock, patch
 
@@ -7,6 +11,7 @@ from fastapi.testclient import TestClient
 import pytest
 
 import api
+import cli
 import db
 
 
@@ -895,3 +900,192 @@ def test_api_web_get_dashboard_and_auth(capsys):
     assert dash_logs[0]["client"] == "web"
     assert dash_logs[0]["status"] == "success"
     assert dash_logs[0]["request_id"] == dash_mock.call_args.kwargs["request_id"]
+
+
+def test_db_cli_authenticate_user(capsys, monkeypatch):
+    monkeypatch.setenv("PASSWORD_SALT", "test-salt")
+    good_hash = db.hash_password("admin123")
+    conn_ok, cur_ok = _make_mock_conn(fetchone_return=(1, good_hash))
+    conn_wrong, _ = _make_mock_conn(fetchone_return=(1, good_hash))
+    conn_missing, _ = _make_mock_conn(fetchone_return=None)
+
+    with patch("db.get_connection", return_value=conn_ok):
+        assert db.cli_authenticate_user("admin", "admin123", "req-cli-ok") is True
+    assert "SELECT id, password_hash FROM users" in cur_ok.execute.call_args.args[0]
+    conn_ok.close.assert_called_once()
+
+    with patch("db.get_connection", return_value=conn_wrong):
+        assert db.cli_authenticate_user("admin", "errada", "req-cli-bad") is False
+    conn_wrong.close.assert_called_once()
+
+    with patch("db.get_connection", return_value=conn_missing):
+        assert db.cli_authenticate_user("outro", "admin123", "req-cli-none") is False
+    conn_missing.close.assert_called_once()
+
+    logs = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert [entry["client"] for entry in logs] == ["cli", "cli", "cli"]
+    assert [entry["operation"] for entry in logs] == ["token", "token", "token"]
+    assert [entry["status"] for entry in logs] == ["success", "error", "error"]
+    assert [entry["request_id"] for entry in logs] == [
+        "req-cli-ok",
+        "req-cli-bad",
+        "req-cli-none",
+    ]
+
+
+def test_api_cli_token_health_and_auth(capsys, monkeypatch):
+    monkeypatch.setenv("SECRET_KEY", "test-secret")
+    cli_token = api.create_cli_token("admin")
+    assert api.verify_cli_token(f"Bearer {cli_token}", request_id="req-cli") == "admin"
+
+    for bad_header in (
+        None,
+        "Bearer sem-ponto",
+        "Bearer admin.assinatura-errada",
+        f"Bearer {api.create_web_token('admin')}",
+    ):
+        with pytest.raises(HTTPException) as exc:
+            api.verify_cli_token(bad_header, request_id="req-cli-err")
+        assert exc.value.status_code == 401
+
+    capsys.readouterr()
+    with patch("db.init_db"):
+        with TestClient(api.app) as client:
+            res_public = client.get("/api/cli/health")
+            res_auth_ok = client.get(
+                "/api/cli/health",
+                headers={"Authorization": f"Bearer {cli_token}"},
+            )
+            res_auth_bad = client.get(
+                "/api/cli/health",
+                headers={"Authorization": "Bearer invalido.assinatura"},
+            )
+            with patch("db.cli_authenticate_user", return_value=True) as auth_ok_mock:
+                res_tok_ok = client.post(
+                    "/api/cli/token",
+                    json={"username": "admin", "password": "admin123"},
+                )
+            with patch("db.cli_authenticate_user", return_value=False):
+                res_tok_bad = client.post(
+                    "/api/cli/token",
+                    json={"username": "admin", "password": "errada"},
+                )
+
+    assert res_public.status_code == 200
+    assert res_public.json() == {"status": "ok", "client": "cli"}
+    assert res_auth_ok.status_code == 200
+    assert res_auth_bad.status_code == 401
+
+    assert res_tok_ok.status_code == 200
+    tok_body = res_tok_ok.json()
+    assert tok_body["status"] == "ok"
+    assert tok_body["token_type"] == "Bearer"
+    assert tok_body["username"] == "admin"
+    assert api.verify_cli_token(f"Bearer {tok_body['token']}") == "admin"
+    assert res_tok_bad.status_code == 401
+
+    logs = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    tok_ok_logs = [
+        entry
+        for entry in logs
+        if entry["client"] == "cli"
+        and entry["operation"] == "token"
+        and entry["status"] == "success"
+    ]
+    assert len(tok_ok_logs) == 1
+    assert tok_ok_logs[0]["request_id"] == auth_ok_mock.call_args.kwargs["request_id"]
+
+
+def test_cli_module_commands_and_entrypoint(capsys, monkeypatch):
+    assert cli.resolve_token("  tok-arg ") == "tok-arg"
+    monkeypatch.setenv("CLI_TOKEN", " tok-env ")
+    assert cli.resolve_token(None) == "tok-env"
+    monkeypatch.delenv("CLI_TOKEN", raising=False)
+    assert cli.resolve_token(None) == ""
+
+    def _mock_resp(status: int, payload: dict):
+        resp = MagicMock()
+        resp.status = status
+        resp.read.return_value = json.dumps(payload).encode("utf-8")
+        cm = MagicMock()
+        cm.__enter__.return_value = resp
+        return cm
+
+    with patch(
+        "urllib.request.urlopen",
+        return_value=_mock_resp(200, {"status": "ok", "client": "cli"}),
+    ) as mock_open:
+        rc = cli.main(["--base-url", "http://localhost:8000", "health"])
+    assert rc == 0
+    req = mock_open.call_args.args[0]
+    assert req.full_url == "http://localhost:8000/api/cli/health"
+    assert req.get_method() == "GET"
+    assert json.loads(capsys.readouterr().out.strip()) == {
+        "status": "ok",
+        "client": "cli",
+    }
+
+    with patch(
+        "urllib.request.urlopen",
+        return_value=_mock_resp(200, {"status": "ok", "client": "cli"}),
+    ) as mock_auth_open:
+        rc_auth = cli.main(["--token", "meu-token", "health", "--auth"])
+    assert rc_auth == 0
+    assert mock_auth_open.call_args.args[0].headers["Authorization"] == "Bearer meu-token"
+    capsys.readouterr()
+
+    rc_no_tok = cli.main(["health", "--auth"])
+    assert rc_no_tok == 1
+    assert "CLI_TOKEN" in capsys.readouterr().err
+
+    with patch(
+        "urllib.request.urlopen",
+        return_value=_mock_resp(
+            200, {"status": "ok", "token": "t.sig", "token_type": "Bearer"}
+        ),
+    ) as mock_tok_open:
+        rc_tok = cli.main(["token", "--username", "admin", "--password", "admin123"])
+    assert rc_tok == 0
+    tok_req = mock_tok_open.call_args.args[0]
+    assert tok_req.get_method() == "POST"
+    assert json.loads(tok_req.data.decode("utf-8")) == {
+        "username": "admin",
+        "password": "admin123",
+    }
+    capsys.readouterr()
+
+    http_401 = urllib.error.HTTPError(
+        "http://api:8000/api/cli/token",
+        401,
+        "Unauthorized",
+        {},
+        io.BytesIO(b'{"detail":"Credenciais invalidas"}'),
+    )
+    with patch("urllib.request.urlopen", side_effect=http_401):
+        rc_err = cli.main(["token", "--username", "admin", "--password", "errada"])
+    assert rc_err == 1
+    assert json.loads(capsys.readouterr().out.strip()) == {
+        "detail": "Credenciais invalidas"
+    }
+
+    http_502 = urllib.error.HTTPError(
+        "http://api:8000/api/cli/health",
+        502,
+        "Bad Gateway",
+        {},
+        io.BytesIO(b"upstream down"),
+    )
+    with patch("urllib.request.urlopen", side_effect=http_502):
+        code_502, body_502 = cli.request_api("http://api:8000", "GET", "/api/cli/health")
+    assert code_502 == 502
+    assert body_502 == {"detail": "upstream down"}
+
+    monkeypatch.setattr(sys, "argv", ["cli.py", "health"])
+    with patch(
+        "urllib.request.urlopen",
+        return_value=_mock_resp(200, {"status": "ok", "client": "cli"}),
+    ):
+        with pytest.raises(SystemExit) as main_exit:
+            runpy.run_path(cli.__file__, run_name="__main__")
+    assert main_exit.value.code == 0
+    capsys.readouterr()
