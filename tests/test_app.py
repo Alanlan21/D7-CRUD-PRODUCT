@@ -490,6 +490,64 @@ def test_db_web_search_products_without_filters(capsys):
     assert json.loads(capsys.readouterr().out)["operation"] == "search"
 
 
+def test_db_web_export_products_with_and_without_filters(capsys):
+    row = (17, "Teclado", "Perifericos", Decimal("125.90"), 8, "Mecanico")
+    conn_filtered, cur_filtered = _make_mock_conn()
+    cur_filtered.fetchall.return_value = [row]
+
+    with patch("db.get_connection", return_value=conn_filtered):
+        filtered_items = db.web_export_products(
+            search="tecla",
+            category="Perifericos",
+            min_price=Decimal("100.00"),
+            max_price=Decimal("200.00"),
+            sort_by="price",
+            order="desc",
+            request_id="req-export-filtered",
+        )
+
+    sql_filtered, params_filtered = cur_filtered.execute.call_args.args
+    assert "WHERE" in sql_filtered
+    assert "LIMIT" not in sql_filtered
+    assert "ORDER BY price DESC, id ASC" in sql_filtered
+    assert params_filtered == (
+        "%tecla%",
+        "Perifericos",
+        Decimal("100.00"),
+        Decimal("200.00"),
+    )
+    assert len(filtered_items) == 1
+    assert filtered_items[0]["name"] == "Teclado"
+    conn_filtered.close.assert_called_once()
+
+    conn_all, cur_all = _make_mock_conn()
+    cur_all.fetchall.return_value = []
+    with patch("db.get_connection", return_value=conn_all):
+        all_items = db.web_export_products(
+            search=None,
+            category=None,
+            min_price=None,
+            max_price=None,
+            sort_by="id",
+            order="asc",
+            request_id="req-export-all",
+        )
+
+    sql_all, params_all = cur_all.execute.call_args.args
+    assert "WHERE" not in sql_all
+    assert "LIMIT" not in sql_all
+    assert params_all == ()
+    assert all_items == []
+    conn_all.close.assert_called_once()
+
+    logs = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert [entry["operation"] for entry in logs] == ["export", "export"]
+    assert [entry["request_id"] for entry in logs] == [
+        "req-export-filtered",
+        "req-export-all",
+    ]
+
+
 def test_db_web_delete_product(capsys):
     ok_conn, ok_cursor = _make_mock_conn(fetchone_return=(7,))
     with patch("db.get_connection", return_value=ok_conn):
@@ -637,6 +695,58 @@ def test_api_web_search_products_auth_filters_and_validation(capsys):
     assert search_logs[0]["request_id"] == search_kwargs["request_id"]
 
 
+def test_api_web_export_products_auth_filters_and_csv(capsys):
+    sample_items = [
+        {
+            "id": 17,
+            "name": "Teclado",
+            "category": "Perifericos",
+            "price": Decimal("125.90"),
+            "stock": 8,
+            "description": "Mecanico",
+        }
+    ]
+    with patch("db.init_db"):
+        with TestClient(api.app) as client:
+            unauth = client.get("/api/web/records/export")
+            assert unauth.status_code == 401
+
+            token = api.create_web_token("admin")
+            headers = {"Authorization": f"Bearer {token}"}
+            with patch("db.web_export_products", return_value=sample_items) as exp_mock:
+                response = client.get(
+                    "/api/web/records/export"
+                    "?search=tecla&category=Perifericos&min_price=100"
+                    "&max_price=200&sort_by=price&order=desc",
+                    headers=headers,
+                )
+                bad_range = client.get(
+                    "/api/web/records/export?min_price=200&max_price=100",
+                    headers=headers,
+                )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/csv")
+    assert 'filename="produtos.csv"' in response.headers["content-disposition"]
+    assert response.text.splitlines() == [
+        "id,name,category,price,stock,description",
+        "17,Teclado,Perifericos,125.90,8,Mecanico",
+    ]
+    exp_kwargs = exp_mock.call_args.kwargs
+    assert exp_kwargs["search"] == "tecla"
+    assert exp_kwargs["category"] == "Perifericos"
+    assert exp_kwargs["min_price"] == Decimal("100")
+    assert exp_kwargs["max_price"] == Decimal("200")
+    assert exp_kwargs["sort_by"] == "price"
+    assert exp_kwargs["order"] == "desc"
+    assert bad_range.status_code == 422
+
+    logs = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    export_logs = [entry for entry in logs if entry["operation"] == "export"]
+    assert len(export_logs) == 1
+    assert export_logs[0]["request_id"] == exp_kwargs["request_id"]
+
+
 def test_api_web_delete_product_and_auth(capsys):
     with patch("db.init_db"):
         with TestClient(api.app) as client:
@@ -682,7 +792,9 @@ def test_index_contains_listing_pagination_sort_and_delete_controls():
         'id="search-min-price"',
         'id="search-max-price"',
         'id="clear-search-btn"',
+        'id="export-csv-btn"',
         "/api/web/records/search",
+        "/api/web/records/export",
         "/api/web/records",
     ):
         assert marker in res_index.text

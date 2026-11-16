@@ -156,3 +156,21 @@ Para executar os testes e confirmar 100% de cobertura de linhas em `api.py` e `d
 ```bash
 docker compose run --rm api pytest --cov=api --cov=db --cov-report=term-missing --cov-fail-under=100
 ```
+
+---
+
+## Issue #5 — Exportação CSV Web de Produtos
+
+No **Painel de Produtos**, clique em **Exportar CSV** para baixar o arquivo `produtos.csv` com as colunas `id`, `name`, `category`, `price`, `stock` e `description`:
+
+- Se houver filtros ativos na busca avançada (`search`, `category`, `min_price`, `max_price`), o CSV inclui **todos os registros correspondentes aos filtros**, sem se limitar aos 5 itens da página atual.
+- Sem filtros ativos, o CSV exporta **todos os produtos cadastrados** no banco respeitando a ordenação selecionada (`sort_by` e `order`).
+
+O endpoint protegido `GET /api/web/records/export` exige o token Web em `Authorization: Bearer <token>` (retorna HTTP 401 sem autenticação válida e HTTP 422 se `min_price > max_price`), executa `db.web_export_products` e registra logs JSON correlacionados por `request_id` (`operation: "export"`) nas camadas `api` e `db`.
+
+Para consultar os logs e validar 100% de cobertura via Docker Compose:
+
+```bash
+docker compose logs -f api
+docker compose run --rm api pytest --cov=api --cov=db --cov-report=term-missing --cov-fail-under=100
+```

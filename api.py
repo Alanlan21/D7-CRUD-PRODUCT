@@ -1,8 +1,10 @@
 from contextlib import asynccontextmanager
+import csv
 from datetime import datetime, timezone
 from decimal import Decimal
 import hashlib
 import hmac
+import io
 import json
 import os
 from pathlib import Path
@@ -10,7 +12,7 @@ from typing import Annotated, Literal
 import uuid
 
 from fastapi import FastAPI, Header, HTTPException, Query
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel, Field, StringConstraints
 
 import db
@@ -314,6 +316,62 @@ def web_search_records(
         "sort_by": sort_by,
         "order": order,
     }
+
+
+@app.get("/api/web/records/export")
+def web_export_records(
+    search: str | None = Query(default=None, max_length=120),
+    category: ProductCategory | None = Query(default=None),
+    min_price: Decimal | None = Query(default=None, ge=0),
+    max_price: Decimal | None = Query(default=None, ge=0),
+    sort_by: SortField = Query(default="id"),
+    order: SortOrder = Query(default="asc"),
+    authorization: str | None = Header(default=None),
+):
+    req_id = new_request_id()
+    verify_web_token(authorization, request_id=req_id)
+    if min_price is not None and max_price is not None and min_price > max_price:
+        raise HTTPException(
+            status_code=422,
+            detail="O preco minimo nao pode ser maior que o preco maximo",
+        )
+
+    items = db.web_export_products(
+        search=search,
+        category=category,
+        min_price=min_price,
+        max_price=max_price,
+        sort_by=sort_by,
+        order=order,
+        request_id=req_id,
+    )
+    buffer = io.StringIO()
+    writer = csv.writer(buffer, lineterminator="\n")
+    writer.writerow(["id", "name", "category", "price", "stock", "description"])
+    for item in items:
+        writer.writerow(
+            [
+                item["id"],
+                item["name"],
+                item["category"],
+                f"{item['price']:.2f}",
+                item["stock"],
+                item["description"],
+            ]
+        )
+
+    log_api(
+        client="web",
+        operation="export",
+        status="success",
+        request_id=req_id,
+        message="Exportacao CSV Web concluida",
+    )
+    return Response(
+        content=buffer.getvalue(),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": 'attachment; filename="produtos.csv"'},
+    )
 
 
 @app.delete("/api/web/records/{product_id}")
