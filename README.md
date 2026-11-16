@@ -195,3 +195,46 @@ Para consultar os logs e validar 100% de cobertura via Docker Compose:
 docker compose logs -f api
 docker compose run --rm api pytest --cov=api --cov=db --cov-report=term-missing --cov-fail-under=100
 ```
+
+---
+
+## Issue #7 — Estrutura CLI, Autenticação por Token e Logs
+
+A interface de linha de comando (`cli.py`) roda integralmente dentro do contêiner Docker (`api`) sem nenhuma dependência instalada no host, comunicando-se exclusivamente via HTTP com os endpoints próprios da CLI em `api.py` (sem acesso direto ao banco).
+
+### 1. Como usar a CLI via Docker Compose
+
+Com os serviços ativos (`docker compose up -d --build`), consulte a ajuda e os subcomandos disponíveis:
+
+```bash
+docker compose run --rm api python cli.py --help
+docker compose run --rm api python cli.py health
+```
+
+Para emitir um Bearer token na rota `POST /api/cli/token`:
+
+```bash
+docker compose run --rm api python cli.py token --username admin --password admin123
+```
+
+Nos comandos protegidos, passe o token retornado via parâmetro `--token <TOKEN>` ou pela variável de ambiente `CLI_TOKEN` (sem token válido, a API retorna **HTTP 401**):
+
+```bash
+docker compose run --rm -e CLI_TOKEN="<TOKEN>" api python cli.py health --auth
+```
+
+*(Caso execute fora do serviço Compose ou com outro endereço, utilize `--base-url` ou `API_BASE_URL`; por padrão na rede do Compose a CLI usa `http://api:8000`.)*
+
+### 2. Endpoints Exclusivos CLI e Logs Estruturados
+
+- `GET /api/cli/health`: healthcheck exclusivo da CLI (`HTTP 200`; valida Bearer token com `HTTP 401` se o cabeçalho `Authorization` for enviado).
+- `POST /api/cli/token`: valida usuário e senha via `db.cli_authenticate_user` (`HTTP 200` com `token` e `token_type: "Bearer"`; `HTTP 401` para credenciais inválidas).
+- Logs JSON são emitidos no `stdout` com `client: "cli"` nas camadas `api` e `db` compartilhando o mesmo `request_id`. Consulte com `docker compose logs -f api`.
+
+### 3. Testes e 100% de Cobertura (incluindo `cli.py`)
+
+A partir da Issue #7, o comando de testes unitários verifica 100% de cobertura de linhas em `api.py`, `db.py` e `cli.py`:
+
+```bash
+docker compose run --rm api pytest --cov=api --cov=db --cov=cli --cov-report=term-missing --cov-fail-under=100
+```

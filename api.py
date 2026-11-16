@@ -75,44 +75,67 @@ def create_web_token(username: str) -> str:
     return f"{username}.{signature}"
 
 
-def verify_web_token(authorization: str | None, request_id: str = "req-auth") -> str:
+def _verify_signed_token(
+    client: str,
+    authorization: str | None,
+    request_id: str,
+    detail: str,
+) -> str:
+    label = client.upper()
     if not authorization or not authorization.startswith("Bearer "):
         log_api(
-            client="web",
+            client=client,
             operation="auth",
             status="error",
             request_id=request_id,
-            message="Token Web ausente ou malformado",
+            message=f"Token {label} ausente ou malformado",
             level="WARN",
         )
-        raise HTTPException(status_code=401, detail="Nao autorizado")
+        raise HTTPException(status_code=401, detail=detail)
 
     raw_token = authorization.removeprefix("Bearer ").strip()
     if "." not in raw_token:
         log_api(
-            client="web",
+            client=client,
             operation="auth",
             status="error",
             request_id=request_id,
-            message="Formato de token Web invalido",
+            message=f"Formato de token {label} invalido",
             level="WARN",
         )
-        raise HTTPException(status_code=401, detail="Nao autorizado")
+        raise HTTPException(status_code=401, detail=detail)
 
     username, signature = raw_token.split(".", 1)
-    expected_sig = _sign_value(f"web:{username}")
+    expected_sig = _sign_value(f"{client}:{username}")
     if not username or not hmac.compare_digest(signature, expected_sig):
         log_api(
-            client="web",
+            client=client,
             operation="auth",
             status="error",
             request_id=request_id,
-            message="Assinatura de token Web invalida",
+            message=f"Assinatura de token {label} invalida",
             level="WARN",
         )
-        raise HTTPException(status_code=401, detail="Nao autorizado")
+        raise HTTPException(status_code=401, detail=detail)
 
     return username
+
+
+def verify_web_token(authorization: str | None, request_id: str = "req-auth") -> str:
+    return _verify_signed_token("web", authorization, request_id, "Nao autorizado")
+
+
+def create_cli_token(username: str) -> str:
+    signature = _sign_value(f"cli:{username}")
+    return f"{username}.{signature}"
+
+
+def verify_cli_token(
+    authorization: str | None, request_id: str = "req-cli-auth"
+) -> str:
+    return _verify_signed_token(
+        "cli", authorization, request_id, "Token CLI ausente ou invalido"
+    )
 
 
 @asynccontextmanager
@@ -418,3 +441,53 @@ def web_get_dashboard(
         message="Dashboard Web carregado",
     )
     return {"status": "ok", **dashboard}
+
+
+@app.get("/api/cli/health")
+def cli_health(
+    authorization: str | None = Header(default=None),
+):
+    req_id = new_request_id()
+    if authorization is not None:
+        verify_cli_token(authorization, request_id=req_id)
+    log_api(
+        client="cli",
+        operation="health",
+        status="success",
+        request_id=req_id,
+        message="Healthcheck CLI OK",
+    )
+    return {"status": "ok", "client": "cli"}
+
+
+@app.post("/api/cli/token")
+def cli_issue_token(payload: LoginPayload):
+    req_id = new_request_id()
+    authenticated = db.cli_authenticate_user(
+        payload.username, payload.password, request_id=req_id
+    )
+    if not authenticated:
+        log_api(
+            client="cli",
+            operation="token",
+            status="error",
+            request_id=req_id,
+            message="Credenciais CLI invalidas",
+            level="WARN",
+        )
+        raise HTTPException(status_code=401, detail="Credenciais invalidas")
+
+    token = create_cli_token(payload.username)
+    log_api(
+        client="cli",
+        operation="token",
+        status="success",
+        request_id=req_id,
+        message="Token CLI emitido com sucesso",
+    )
+    return {
+        "status": "ok",
+        "token": token,
+        "token_type": "Bearer",
+        "username": payload.username,
+    }

@@ -480,3 +480,37 @@ def web_get_dashboard(request_id: str) -> dict:
         "financial_by_category": financial_by_category,
         "totals": totals,
     }
+
+
+def cli_authenticate_user(username: str, password: str, request_id: str) -> bool:
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, password_hash FROM users WHERE username = %s;",
+                (username,),
+            )
+            row = cur.fetchone()
+    finally:
+        conn.close()
+
+    expected_hash = hash_password(password)
+    if row is not None and row[1] == expected_hash:
+        log_db(
+            client="cli",
+            operation="token",
+            status="success",
+            request_id=request_id,
+            message="Usuario CLI autenticado no banco",
+        )
+        return True
+
+    log_db(
+        client="cli",
+        operation="token",
+        status="error",
+        request_id=request_id,
+        message="Falha de autenticacao CLI no banco",
+        level="WARN",
+    )
+    return False
