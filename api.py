@@ -341,6 +341,24 @@ def web_search_records(
     }
 
 
+def _render_products_csv(items: list[dict]) -> str:
+    buffer = io.StringIO()
+    writer = csv.writer(buffer, lineterminator="\n")
+    writer.writerow(["id", "name", "category", "price", "stock", "description"])
+    for item in items:
+        writer.writerow(
+            [
+                item["id"],
+                item["name"],
+                item["category"],
+                f"{item['price']:.2f}",
+                item["stock"],
+                item["description"],
+            ]
+        )
+    return buffer.getvalue()
+
+
 @app.get("/api/web/records/export")
 def web_export_records(
     search: str | None = Query(default=None, max_length=120),
@@ -368,20 +386,7 @@ def web_export_records(
         order=order,
         request_id=req_id,
     )
-    buffer = io.StringIO()
-    writer = csv.writer(buffer, lineterminator="\n")
-    writer.writerow(["id", "name", "category", "price", "stock", "description"])
-    for item in items:
-        writer.writerow(
-            [
-                item["id"],
-                item["name"],
-                item["category"],
-                f"{item['price']:.2f}",
-                item["stock"],
-                item["description"],
-            ]
-        )
+    csv_content = _render_products_csv(items)
 
     log_api(
         client="web",
@@ -391,7 +396,7 @@ def web_export_records(
         message="Exportacao CSV Web concluida",
     )
     return Response(
-        content=buffer.getvalue(),
+        content=csv_content,
         media_type="text/csv; charset=utf-8",
         headers={"Content-Disposition": 'attachment; filename="produtos.csv"'},
     )
@@ -638,6 +643,49 @@ def cli_search_records(
         "sort_by": sort_by,
         "order": order,
     }
+
+
+@app.get("/api/cli/records/export")
+def cli_export_records(
+    search: str | None = Query(default=None, max_length=120),
+    category: ProductCategory | None = Query(default=None),
+    min_price: Decimal | None = Query(default=None, ge=0),
+    max_price: Decimal | None = Query(default=None, ge=0),
+    sort_by: SortField = Query(default="id"),
+    order: SortOrder = Query(default="asc"),
+    authorization: str | None = Header(default=None),
+):
+    req_id = new_request_id()
+    verify_cli_token(authorization, request_id=req_id)
+    if min_price is not None and max_price is not None and min_price > max_price:
+        raise HTTPException(
+            status_code=422,
+            detail="O preco minimo nao pode ser maior que o preco maximo",
+        )
+
+    items = db.cli_export_products(
+        search=search,
+        category=category,
+        min_price=min_price,
+        max_price=max_price,
+        sort_by=sort_by,
+        order=order,
+        request_id=req_id,
+    )
+    csv_content = _render_products_csv(items)
+
+    log_api(
+        client="cli",
+        operation="export",
+        status="success",
+        request_id=req_id,
+        message="Exportacao CSV CLI concluida",
+    )
+    return Response(
+        content=csv_content,
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": 'attachment; filename="produtos_cli.csv"'},
+    )
 
 
 @app.delete("/api/cli/records/{product_id}")

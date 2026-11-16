@@ -370,3 +370,42 @@ docker compose run --rm -e CLI_TOKEN="<TOKEN>" api python cli.py search --min-pr
 ```bash
 docker compose run --rm api pytest --cov=api --cov=db --cov=cli --cov-report=term-missing --cov-fail-under=100
 ```
+
+---
+
+## Issue #11 — Exportação CSV de Produtos na CLI
+
+O subcomando `export` em `cli.py` exporta todos os produtos em formato CSV (`id,name,category,price,stock,description`) consumindo exclusivamente `GET /api/cli/records/export` e `db.cli_export_products`, sem se limitar à página atual e permitindo combinar os mesmos filtros da busca avançada (`--search`, `--category`, `--min-price`, `--max-price`) e ordenação (`--sort-by`, `--order`).
+
+### 1. Como executar e acessar o arquivo CSV gerado via Docker Compose
+
+Para imprimir o CSV diretamente no `stdout`:
+
+```bash
+docker compose run --rm -e CLI_TOKEN="<TOKEN>" api python cli.py export
+```
+
+Para filtrar e salvar em arquivo usando `--output`:
+
+```bash
+docker compose run --rm -e CLI_TOKEN="<TOKEN>" api python cli.py export \
+  --search "tecla" \
+  --category "Perifericos" \
+  --min-price "100.00" \
+  --max-price "300.00" \
+  --output /app/produtos_cli.csv
+```
+
+Como o serviço `api` no `docker-compose.yml` monta o diretório do repositório em `/app`, o arquivo `/app/produtos_cli.csv` gerado no contêiner fica acessível imediatamente no host em `./produtos_cli.csv`.
+
+### 2. Autenticação, Validação e Logs Correlacionados
+
+- **Autenticação:** exige Bearer token CLI válido em `Authorization: Bearer <token>` (retorna **HTTP 401** quando ausente ou inválido).
+- **Validação:** retorna **HTTP 422** caso `min_price > max_price` ou os filtros/ordenação sejam inválidos.
+- **Logs JSON correlacionados:** registra eventos com `client: "cli"`, `operation: "export"` e o mesmo `request_id` nas camadas `api` e `db`. Consulte com `docker compose logs -f api`.
+
+### 3. Testes Unitários e 100% de Cobertura (`api.py`, `db.py` e `cli.py`)
+
+```bash
+docker compose run --rm api pytest --cov=api --cov=db --cov=cli --cov-report=term-missing --cov-fail-under=100
+```
