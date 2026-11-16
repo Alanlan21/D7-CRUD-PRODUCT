@@ -269,17 +269,12 @@ def web_list_products(
     return {"items": items, "total": total}
 
 
-def web_search_products(
+def _build_product_filters(
     search: str | None,
     category: str | None,
     min_price: Decimal | None,
     max_price: Decimal | None,
-    page: int,
-    page_size: int,
-    sort_by: str,
-    order: str,
-    request_id: str,
-) -> dict:
+) -> tuple[str, list]:
     filters = []
     filter_params = []
     if search and search.strip():
@@ -296,6 +291,26 @@ def web_search_products(
         filter_params.append(max_price)
 
     where_clause = f" WHERE {' AND '.join(filters)}" if filters else ""
+    return where_clause, filter_params
+
+
+def web_search_products(
+    search: str | None,
+    category: str | None,
+    min_price: Decimal | None,
+    max_price: Decimal | None,
+    page: int,
+    page_size: int,
+    sort_by: str,
+    order: str,
+    request_id: str,
+) -> dict:
+    where_clause, filter_params = _build_product_filters(
+        search=search,
+        category=category,
+        min_price=min_price,
+        max_price=max_price,
+    )
     sort_column = SORT_COLUMNS[sort_by]
     sort_direction = "ASC" if order.lower() == "asc" else "DESC"
     offset = (page - 1) * page_size
@@ -330,6 +345,50 @@ def web_search_products(
         message="Produtos buscados no banco",
     )
     return {"items": items, "total": total}
+
+
+def web_export_products(
+    search: str | None,
+    category: str | None,
+    min_price: Decimal | None,
+    max_price: Decimal | None,
+    sort_by: str,
+    order: str,
+    request_id: str,
+) -> list[dict]:
+    where_clause, filter_params = _build_product_filters(
+        search=search,
+        category=category,
+        min_price=min_price,
+        max_price=max_price,
+    )
+    sort_column = SORT_COLUMNS[sort_by]
+    sort_direction = "ASC" if order.lower() == "asc" else "DESC"
+
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT id, name, category, price, stock, description
+                FROM products{where_clause}
+                ORDER BY {sort_column} {sort_direction}, id ASC;
+                """,
+                tuple(filter_params),
+            )
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    items = [_product_from_row(row) for row in rows]
+    log_db(
+        client="web",
+        operation="export",
+        status="success",
+        request_id=request_id,
+        message="Produtos consultados para exportacao CSV",
+    )
+    return items
 
 
 def web_delete_product(product_id: int, request_id: str) -> bool:
